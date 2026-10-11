@@ -1,0 +1,262 @@
+# DeepSeek Harness desktop — 一个 CI 打出四种产物：
+#   .deb / .AppImage / .tar.gz / .pkg.tar.zst（Arch，makepkg 出品，布局与 AUR 包一致）
+#
+# 用你自己的 fork 构建（actions/checkout 检出的就是这个仓库），不再重复 clone upstream。
+# 放在 fork 的 .github/workflows/ 下即可。
+#
+# linux-desktop.patch 和 deepseek-harness-linux.env 不在仓库里：
+#   - 若你已把它们提交到 fork 根目录，直接删掉两个 "fetch from AUR" 步骤里 curl 那行；
+#   - 否则 workflow 会从 AUR 现拉（默认，已内置）。
+#
+# pnpm 的装法必须和同目录其它 workflow 一致：
+#   pnpm/action-setup 必须排在 actions/setup-node 之前，因为 setup-node 的
+#   `cache: pnpm` 会执行 `pnpm store path --silent` 去定位 store，而 ubuntu-latest
+#   镜像里没有 pnpm（只带 npm/yarn）→ "Unable to locate executable file: pnpm"。
+#   版本不要手写：action-setup 读根 package.json 的 packageManager（pnpm@11.28.5）。
+
+name: build-dsh-desktop-linux
+
+on:
+  workflow_dispatch:                 # 手动触发
+  push:
+    tags: ['v*']                     # 推 tag 时触发
+
+env:
+  NODE_VERSION: '22.19.0'
+  APP_NAME: 'deepseek-harness-desktop'
+  # 与仓库根 package.json 的版本保持一致（打包脚本按仓库版本产出产物）
+  APP_VERSION: '0.2.1-alpha.2'
+  # package:dir 的产出目录（PKGBUILD 里的固定路径）
+  UNPACKED: 'apps/desktop/.desktop-build/targets/linux-x64/artifacts/linux-unpacked'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (your fork)
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      # 必须排在 setup-node 前面：版本由根 package.json 的 packageManager 决定。
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Apply linux-desktop patch
+        run: |
+          if [ ! -f linux-desktop.patch ]; then
+            curl -fsSL -o linux-desktop.patch \
+              "https://aur.archlinux.org/cgit/aur.git/plain/linux-desktop.patch?h=deepseek-harness-desktop"
+          fi
+          patch -Np1 --no-backup-if-mismatch -i linux-desktop.patch
+
+      - name: Install linux env file
+        run: |
+          if [ ! -f deepseek-harness-linux.env ]; then
+            curl -fsSL -o deepseek-harness-linux.env \
+              "https://aur.archlinux.org/cgit/aur.git/plain/deepseek-harness-linux.env?h=deepseek-harness-desktop"
+          fi
+          install -Dm644 deepseek-harness-linux.env apps/desktop/.env.linux
+
+      - name: Pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Package linux-x64 (unpacked)
+        run: pnpm --filter @deepseek-ai/dsh-desktop run package:dir
+
+      - name: Package into .tar.gz
+        run: |
+          # run 步骤的 cwd 本来就是 $GITHUB_WORKSPACE，原来先写相对路径再 mv 到同一个
+          # 地方，mv 判定 "are the same file" 直接退出 1；这里直接写成绝对路径。
+          tar -C "$GITHUB_WORKSPACE/$UNPACKED" \
+            -czf "$GITHUB_WORKSPACE/$APP_NAME-linux-x64.tar.gz" .
+          ls -l "$GITHUB_WORKSPACE/$APP_NAME-linux-x64.tar.gz"
+
+      # makepkg 只存在于 Arch，所以在官方 archlinux:base-devel 容器里打包
+      # （GitHub 的 ubuntu runner 自带 docker）。载荷直接复用上面 package:dir 的
+      # 产出，package() 只做安装布局，不重新编译；-d 跳过依赖检查。
+      - name: Package into .pkg.tar.zst (Arch / makepkg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/arch-pkg"
+          PKGVER="$(printf '%s' "$APP_VERSION" | tr -d '-')"   # pacman 的 pkgver 不允许出现 '-'
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+
+          cat > "$STAGE/deepseek-harness-desktop.sh" <<'WRAP'
+          #!/bin/sh
+          # Chromium 的沙箱用非特权 user namespace，Arch 默认开启；内核不支持时才需要 --no-sandbox。
+          exec /usr/lib/deepseek-harness-desktop/deepseek-harness "$@"
+          WRAP
+
+          cat > "$STAGE/deepseek-ai-dsh-desktop.desktop" <<'DESK'
+          [Desktop Entry]
+          Type=Application
+          Name=DeepSeek Harness
+          Comment=DeepSeek Harness desktop application
+          Exec=deepseek-harness-desktop %U
+          Icon=deepseek-harness
+          Terminal=false
+          StartupNotify=true
+          StartupWMClass=deepseek-ai-dsh-desktop
+          Categories=Development;
+          Keywords=AI;agent;deepseek;harness;dsh;
+          MimeType=x-scheme-handler/dsh;
+          DESK
+
+          # 与 AUR 的 deepseek-harness-desktop 保持同一套 depends / 目录布局
+          cat > "$STAGE/PKGBUILD" <<EOF
+          pkgname=deepseek-harness-desktop
+          pkgver=$PKGVER
+          pkgrel=1
+          pkgdesc='DeepSeek Harness desktop application (Electron shell and bundled dsh runtime)'
+          arch=('x86_64')
+          url='https://github.com/deepseek-ai/deepseek-harness'
+          license=('MIT')
+          depends=('alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'glib2' 'gtk3' 'libcups'
+            'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes'
+            'libxkbcommon' 'libxrandr' 'mesa' 'nss' 'pango' 'systemd-libs' 'xdg-utils')
+          optdepends=('zenity: native directory dialogs for local directory selection'
+            'kdialog: native directory dialogs on Plasma')
+          options=('!strip' '!debug')
+
+          package() {
+            install -d "\$pkgdir/usr/lib/\$pkgname" "\$pkgdir/usr/bin"
+            cp -a "\$DSH_UNPACKED/." "\$pkgdir/usr/lib/\$pkgname/"
+            install -Dm755 "\$startdir/deepseek-harness-desktop.sh" "\$pkgdir/usr/bin/\$pkgname"
+            install -Dm644 "\$startdir/deepseek-ai-dsh-desktop.desktop" \
+              "\$pkgdir/usr/share/applications/deepseek-ai-dsh-desktop.desktop"
+            install -Dm644 "\$DSH_REPO/apps/desktop/resources/icon.png" \
+              "\$pkgdir/usr/share/icons/hicolor/512x512/apps/deepseek-harness.png"
+            install -Dm644 "\$DSH_REPO/apps/desktop/resources/icon.svg" \
+              "\$pkgdir/usr/share/icons/hicolor/scalable/apps/deepseek-harness.svg"
+            install -Dm644 "\$DSH_REPO/LICENSE" "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+          }
+          EOF
+
+          cat > "$STAGE/in-container.sh" <<'CONT'
+          set -euo pipefail
+          # makepkg 拒绝以 root 运行：建一个 builder，只把打包目录交给它
+          useradd -m builder
+          # 固定扩展名与压缩级别（PKGEXT 走环境变量覆盖；stock 的 zstd --ultra -20
+          # 对几百 MB 的 Electron 载荷太慢）
+          mkdir -p /home/builder/.config/pacman
+          cat > /home/builder/.config/pacman/makepkg.conf <<'CONF'
+          COMPRESSZST=(zstd -c -T0 -6 -)
+          CONF
+          chown -R builder:builder "$PWD" /home/builder/.config
+          su - builder -c "cd '$PWD' && PKGEXT='.pkg.tar.zst' PACKAGER='dsh-desktop-ci <noreply@github.com>' DSH_UNPACKED='$DSH_UNPACKED' DSH_REPO='$DSH_REPO' makepkg -f -d --noconfirm"
+          CONT
+
+          docker run --rm \
+            -e DSH_UNPACKED="$GITHUB_WORKSPACE/$UNPACKED" \
+            -e DSH_REPO="$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -w "$STAGE" \
+            archlinux:base-devel bash "$STAGE/in-container.sh"
+
+          cp "$STAGE/$APP_NAME-"*.pkg.tar.zst "$GITHUB_WORKSPACE/"
+          ls -l "$GITHUB_WORKSPACE"/*.pkg.tar.zst
+
+      - name: Package into .deb
+        shell: bash
+        run: |
+          set -e
+          STAGE="$RUNNER_TEMP/deb"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          mkdir -p "$STAGE/opt/$APP_NAME" "$STAGE/usr/bin" \
+                   "$STAGE/usr/share/applications" \
+                   "$STAGE/usr/share/icons/hicolor/512x512/apps" \
+                   "$STAGE/usr/share/icons/hicolor/scalable/apps" \
+                   "$STAGE/DEBIAN"
+          cp -a "$UNPACKED/." "$STAGE/opt/$APP_NAME/"
+          cat > "$STAGE/usr/bin/$APP_NAME" <<'WRAP'
+          #!/bin/sh
+          exec /opt/deepseek-harness-desktop/deepseek-harness "$@"
+          WRAP
+          chmod 755 "$STAGE/usr/bin/$APP_NAME"
+          cat > "$STAGE/usr/share/applications/deepseek-ai-dsh-desktop.desktop" <<DESK
+          [Desktop Entry]
+          Type=Application
+          Name=DeepSeek Harness
+          Comment=DeepSeek Harness desktop application
+          Exec=$APP_NAME %U
+          Icon=deepseek-harness
+          Terminal=false
+          StartupNotify=true
+          StartupWMClass=deepseek-ai-dsh-desktop
+          Categories=Development;
+          Keywords=AI;agent;deepseek;harness;dsh;
+          MimeType=x-scheme-handler/dsh;
+          DESK
+          cp apps/desktop/resources/icon.png "$STAGE/usr/share/icons/hicolor/512x512/apps/deepseek-harness.png"
+          cp apps/desktop/resources/icon.svg "$STAGE/usr/share/icons/hicolor/scalable/apps/deepseek-harness.svg"
+          cat > "$STAGE/DEBIAN/control" <<CTRL
+          Package: $APP_NAME
+          Version: $APP_VERSION
+          Architecture: amd64
+          Maintainer: your-name <you@example.com>
+          Depends: libc6, libgtk-3-0, libnss3, libasound2, libx11-6, libxcb1, \
+            libxcomposite1, libxdamage1, libxext6, libxfixes3, libxkbcommon0, \
+            libxrandr2, libcups2, libdbus-1-3, libexpat1, libglib2.0-0, \
+            libpango-1.0-0, libcairo2, libatspi2.0-0, libgbm1
+          Section: devel
+          Priority: optional
+          Description: DeepSeek Harness desktop application (Electron shell and bundled dsh runtime)
+          CTRL
+          dpkg-deb --build --root-owner-group "$STAGE" "$GITHUB_WORKSPACE/$APP_NAME-$APP_VERSION-linux-x64.deb"
+
+      - name: Package into .AppImage
+        shell: bash
+        run: |
+          set -e
+          APPDIR="$RUNNER_TEMP/AppDir"
+          rm -rf "$APPDIR"; mkdir -p "$APPDIR"
+          cp -a "$UNPACKED/." "$APPDIR/"
+          cat > "$APPDIR/AppRun" <<'RUN'
+          #!/bin/sh
+          HERE=$(dirname "$(readlink -f "$0")")
+          exec "$HERE/deepseek-harness" "$@"
+          RUN
+          chmod 755 "$APPDIR/AppRun"
+          cp apps/desktop/resources/icon.svg "$APPDIR/deepseek-harness.svg"
+          cp apps/desktop/resources/icon.png "$APPDIR/deepseek-harness.png"
+          cat > "$APPDIR/deepseek-ai-dsh-desktop.desktop" <<DESK
+          [Desktop Entry]
+          Type=Application
+          Name=DeepSeek Harness
+          Comment=DeepSeek Harness desktop application
+          Exec=deepseek-harness
+          Icon=deepseek-harness
+          Terminal=false
+          StartupNotify=true
+          Categories=Development;
+          Keywords=AI;agent;deepseek;harness;dsh;
+          MimeType=x-scheme-handler/dsh;
+          DESK
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod 755 "$RUNNER_TEMP/appimagetool"
+          ARCH=x86_64 "$RUNNER_TEMP/appimagetool" --appimage-extract-and-run \
+            "$APPDIR" "$GITHUB_WORKSPACE/$APP_NAME-$APP_VERSION-x86_64.AppImage"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dsh-desktop-linux
+          path: |
+            ${{ github.workspace }}/*.deb
+            ${{ github.workspace }}/*.AppImage
+            ${{ github.workspace }}/*.tar.gz
+            ${{ github.workspace }}/*.pkg.tar.zst
+          if-no-files-found: error
